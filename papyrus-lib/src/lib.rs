@@ -1,6 +1,6 @@
 use std::{
     borrow::BorrowMut,
-    fmt::Debug,
+    fmt::{Debug, Display},
     iter::Peekable,
     num::ParseIntError,
     str::{Chars, FromStr},
@@ -8,7 +8,7 @@ use std::{
 
 use regex::Regex;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TagParseErr {
     NoCaptures,
     CaptureNotFound,
@@ -33,9 +33,8 @@ impl FromStr for Tag {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         lazy_static::lazy_static! {
             static ref USER_RE: Regex = Regex::new(r"user:\s*(?P<id>\d+)").unwrap();
-            static ref ARTICLE_RE: Regex = Regex::new(r"article:\s*(?<id>\d+)").unwrap();
+            static ref ARTICLE_RE: Regex = Regex::new(r"article:\s*(?P<id>\d+)").unwrap();
         }
-
         if let Some(cap) = USER_RE.captures(s) {
             return Ok(Tag::User(
                 cap.name("id")
@@ -56,35 +55,78 @@ impl FromStr for Tag {
             ));
         }
 
-        Err(TagParseErr::UnknownTag(s.to_string()))
+        Err(TagParseErr::UnknownTag(format!("[{s}]")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Position {
+    line: u16,
+}
+
+impl Position {
+    pub fn new(line: u16) -> Self {
+        Self { line }
+    }
+}
+
+impl From<u16> for Position {
+    fn from(line: u16) -> Self {
+        Self::new(line)
     }
 }
 
 pub struct TokenIter<'a> {
     iter: Peekable<Chars<'a>>,
+    position: Position,
+}
+
+impl Display for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}", self.line) // 1 has to be subtracted here, since the Position points at what's next.
+    }
 }
 
 impl<'a> TokenIter<'a> {
     pub fn new<S: Into<&'a str>>(s: S) -> Self {
         TokenIter {
             iter: s.into().chars().peekable(),
+            position: Position::new(1),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TokenizeErr {
+    TagErr(Position, TagParseErr),
+}
+
+impl Display for TokenizeErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TagErr(p, e) => write!(f, "{e:?} at {p}"),
         }
     }
 }
 
 impl<'a> Iterator for TokenIter<'a> {
-    type Item = Token;
+    type Item = Result<Token, TokenizeErr>;
+
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.iter.next() {
+            if next == '\n' {
+                self.position.line += 1;
+            }
+
             return Some(match next {
-                '[' => Token::Tag(
-                    self.iter
-                        .borrow_mut()
-                        .take_while(|p| *p != ']')
-                        .collect::<String>()
-                        .parse::<Tag>()
-                        .unwrap(),
-                ),
+                '[' => self
+                    .iter
+                    .borrow_mut()
+                    .take_while(|p| *p != ']')
+                    .collect::<String>()
+                    .parse::<Tag>()
+                    .map_err(|e| TokenizeErr::TagErr(self.position, e))
+                    .map(|tag| Token::Tag(tag)),
 
                 c => {
                     let mut text = String::from(c);
@@ -92,9 +134,10 @@ impl<'a> Iterator for TokenIter<'a> {
                         if *peek == '[' {
                             break;
                         }
+                        // We can use unrwap here since we checked if there is a next character via iter.peek
                         text.push(self.iter.next().unwrap())
                     }
-                    Token::Text(text)
+                    Ok(Token::Text(text))
                 }
             });
         }
@@ -111,7 +154,7 @@ mod tests {
     pub fn parse_user() {
         assert_eq!(
             TokenIter::new("[user:0]").collect::<Vec<_>>(),
-            vec![Token::Tag(Tag::User(0))]
+            vec![Ok(Token::Tag(Tag::User(0)))]
         );
     }
 
@@ -119,7 +162,31 @@ mod tests {
     pub fn parse_article() {
         assert_eq!(
             TokenIter::new("[article:0]").collect::<Vec<_>>(),
-            vec![Token::Tag(Tag::Article(0))]
+            vec![Ok(Token::Tag(Tag::Article(0)))]
         );
+    }
+
+    #[test]
+    pub fn line_err() {
+        let tag = "\n[unknown]";
+        assert_eq!(
+            TokenIter::new(tag).collect::<Vec<_>>(),
+            vec![Err(TokenizeErr::TagErr(
+                2.into(),
+                TagParseErr::UnknownTag(tag[1..].to_string())
+            ))]
+        )
+    }
+
+    #[test]
+    pub fn parse_err() {
+        let tag = "[unknown:0]";
+        assert_eq!(
+            TokenIter::new(tag).collect::<Vec<_>>(),
+            vec![Err(TokenizeErr::TagErr(
+                1.into(),
+                TagParseErr::UnknownTag(tag.to_string())
+            ))]
+        )
     }
 }
